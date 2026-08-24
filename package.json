@@ -1,0 +1,50 @@
+{
+  "name": "inventory-studio",
+  "version": "1.0.0",
+  "description": "库存整理 Windows 桌面应用",
+  "main": "desktop/main.js",
+  "scripts": {
+    "desktop:dev": "electron .",
+    "backend:build": ".venv-build\\Scripts\\python.exe -m PyInstaller --noconfirm --clean --onedir --name inventory_backend --add-data \"web;web\" --add-data \"lucide.js;.\" --add-data \"模板总模板.xlsx;.\" app.py",
+    "package:win": "npm run backend:build && electron-builder --win nsis"
+  },
+  "build": {
+    "appId": "com.inventorystudio.desktop",
+    "productName": "库存工作台",
+    "artifactName": "库存工作台-安装包-${version}.${ext}",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "desktop/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "dist/inventory_backend",
+        "to": "backend",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "perMachine": false,
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "库存工作台"
+    }
+  },
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^26.0.12"
+  }
+}

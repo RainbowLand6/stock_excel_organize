@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv-build/
+
+# Node.js
+node_modules/
+
+# Build and release artifacts
+build/
+dist/
+release/
+
+# Application runtime data and generated files
+.inventory_data/
+exports/
+output/
+_requirements_doc_render/
+local-data/
+*.log
+
+# Local environment and editor settings
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+
+# Machine-specific inspection and browser verification helpers
+local-tools/
