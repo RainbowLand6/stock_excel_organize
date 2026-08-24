@@ -72,13 +72,3 @@ npm run package:win
 .\.venv\Scripts\python -m pip install -r requirements-docs.txt
 .\.venv\Scripts\python scripts\build_requirements_doc.py
 ```
-
-## 上传 GitHub 前
-
-```powershell
-git status --short
-git add .
-git status --short
-```
-
-确认暂存区只包含源码、文档、模板、依赖清单与构建配置。不要强制添加 `.inventory_data/`、`exports/`、`output/`、`local-data/`、`node_modules/`、`build/`、`dist/` 或 `release/`。
