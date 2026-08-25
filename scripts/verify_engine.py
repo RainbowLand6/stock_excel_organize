@@ -34,6 +34,25 @@ def main():
     app.ensure_directories()
     OUT.mkdir(parents=True, exist_ok=True)
 
+    multipart_body = (
+        b"--boundary\r\n"
+        b"Content-Disposition: form-data; name=\"slot\"\r\n\r\n"
+        b"previous\r\n"
+        b"--boundary\r\n"
+        b"Content-Disposition: form-data; name=\"files\"; filename=\"one.xlsx\"\r\n"
+        b"Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n"
+        b"first\r\n"
+        b"--boundary\r\n"
+        b"Content-Disposition: form-data; name=\"files\"; filename=\"two.xlsx\"\r\n"
+        b"Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n"
+        b"second\r\n"
+        b"--boundary--\r\n"
+    )
+    multipart_form = app.parse_multipart_form(multipart_body, "multipart/form-data; boundary=boundary")
+    assert multipart_form.getfirst("slot") == "previous"
+    assert [item.filename for item in multipart_form["files"]] == ["one.xlsx", "two.xlsx"]
+    assert multipart_form["files"][0].file.read() == b"first"
+
     original_config_path = app.CONFIG_PATH
     legacy_config_path = OUT / "legacy-config.json"
     legacy_config = app.default_config()

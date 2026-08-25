@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import cgi
+import io
 import json
 import logging
 import mimetypes
@@ -17,6 +17,8 @@ import webbrowser
 from copy import copy
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from email import policy
+from email.parser import BytesParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -155,6 +157,58 @@ def safe_filename(value):
 
 def normalize_text(value):
     return "" if value is None else str(value).strip()
+
+
+class UploadedFormFile:
+    """The small uploaded-file interface used by the inventory import methods."""
+
+    def __init__(self, filename, content):
+        self.filename = filename
+        self.file = io.BytesIO(content)
+
+
+class MultipartForm:
+    """Compatibility wrapper for the FieldStorage operations used by this app."""
+
+    def __init__(self):
+        self.values = {}
+
+    def add(self, name, value):
+        self.values.setdefault(name, []).append(value)
+
+    def getfirst(self, name, default=None):
+        values = self.values.get(name)
+        return values[0] if values else default
+
+    def __contains__(self, name):
+        return name in self.values
+
+    def __getitem__(self, name):
+        values = self.values[name]
+        return values[0] if len(values) == 1 else values
+
+
+def parse_multipart_form(body, content_type):
+    """Parse browser multipart uploads without the removed Python 3.14 cgi module."""
+    if "multipart/form-data" not in content_type.lower():
+        raise ValueError("上传请求格式不正确")
+    message = BytesParser(policy=policy.default).parsebytes(
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + body
+    )
+    if not message.is_multipart():
+        raise ValueError("上传请求格式不正确")
+    form = MultipartForm()
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if not name:
+            continue
+        content = part.get_payload(decode=True) or b""
+        filename = part.get_filename()
+        if filename is not None:
+            form.add(name, UploadedFormFile(filename, content))
+        else:
+            form.add(name, content.decode(part.get_content_charset() or "utf-8", errors="replace"))
+    return form
 
 
 def decimal_number(value):
@@ -1243,11 +1297,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
 
     def read_form(self):
-        return cgi.FieldStorage(
-            fp=self.rfile,
-            headers=self.headers,
-            environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type", ""), "CONTENT_LENGTH": self.headers.get("Content-Length", "0")},
-        )
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("上传请求长度不正确") from exc
+        return parse_multipart_form(self.rfile.read(length), self.headers.get("Content-Type", ""))
 
     def do_GET(self):
         parsed = urlparse(self.path)
