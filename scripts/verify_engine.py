@@ -1,6 +1,7 @@
 from decimal import Decimal
 from pathlib import Path
 import sys
+from time import perf_counter
 
 import openpyxl
 
@@ -8,6 +9,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import app
+import inventory_core
+import inventory_service
 
 
 OUT = PROJECT_ROOT / "output" / "verification"
@@ -60,18 +63,18 @@ def main():
     assert [item.filename for item in multipart_form["files"]] == ["one.xlsx", "two.xlsx"]
     assert multipart_form["files"][0].file.read() == b"first"
 
-    original_config_path = app.CONFIG_PATH
+    original_config_path = inventory_core.CONFIG_PATH
     legacy_config_path = OUT / "legacy-config.json"
     legacy_config = app.default_config()
     legacy_config["settings"]["compare_filename"] = "{品牌}_库存对比_{本周日期}.xlsx"
     legacy_config["export_records"] = [{"type": "库存对比"}]
     legacy_config["mappings"] = {"Legacy Brand": "Legacy Source"}
-    app.CONFIG_PATH = legacy_config_path
+    inventory_core.CONFIG_PATH = legacy_config_path
     try:
         app.save_config(legacy_config)
         migrated_config = app.load_config()
     finally:
-        app.CONFIG_PATH = original_config_path
+        inventory_core.CONFIG_PATH = original_config_path
     assert migrated_config["settings"]["compare_filename"] == "{品牌}_单品牌库存对比_{本周日期}.xlsx"
     assert migrated_config["settings"]["summary_compare_filename"] == "汇总对比_{生成日期}.xlsx"
     assert migrated_config["settings"]["special_brand_filename"] == "{品牌}_品牌拆分_{生成日期}.xlsx"
@@ -167,6 +170,22 @@ def main():
     assert "华东仓" in summary["warehouses"]
     assert not summary["unconfigured"]
     assert summary["rows"]
+    missing_mapping = app.build_summary_result([{"brand": "fixture-a", "rows": previous["rows"]}], [])
+    assert missing_mapping["unconfigured"] == [{
+        "brand": "fixture-a",
+        "warehouses": ["Warehouse A", "Warehouse B"],
+        "reason": "尚未配置仓库映射",
+    }]
+    rounded_summary = app.build_summary_result(
+        [{"brand": "rounded", "rows": [{
+            "code": "R-001", "name": "Rounded Product", "spec": "Rounded Spec", "warehouse": "Warehouse R",
+            "main_qty": Decimal("1.235"), "box_qty": Decimal("0.555"),
+        }]}],
+        [],
+    )
+    rounded_product = rounded_summary["rows"][0]
+    assert rounded_product["warehouses"]["Warehouse R"]["main_qty"] == Decimal("1.24")
+    assert rounded_product["total_main"] == Decimal("1.24")
 
     compare_path = OUT / "compare.xlsx"
     summary_path = OUT / "summary.xlsx"
@@ -194,6 +213,8 @@ def main():
     assert summary_sheet["A1"].value == template_book.active["A1"].value
     assert summary_sheet["E2"].value == "德清仓"
     assert summary_sheet.max_row >= 4
+    assert summary_sheet["E4"].number_format == "0.00"
+    assert summary_sheet["G4"].number_format == "0.00"
 
     previous_summary_path = OUT / "previous-summary.xlsx"
     current_summary_path = OUT / "current-summary.xlsx"
@@ -235,10 +256,67 @@ def main():
     assert summary_compare_book.active.title == current_summary_book.active.title
     current_summary_book.close()
     assert summary_compare_book.active["G2"].value == "合计"
-    assert summary_compare_book.active["I2"].value == "同比"
+    assert summary_compare_book.active["I2"].value == "环比"
     assert summary_compare_book.active["J2"].value == "备注"
     assert summary_compare_book.active["J5"].value == "新增物料"
+    assert summary_compare_book.active["I2"].fill.fgColor.rgb == summary_compare_book.active["G2"].fill.fgColor.rgb
+    assert summary_compare_book.active["J2"].fill.fgColor.rgb == summary_compare_book.active["G2"].fill.fgColor.rgb
+    assert summary_compare_book.active["I4"].fill.fgColor.rgb == summary_compare_book.active["G4"].fill.fgColor.rgb
+    assert summary_compare_book.active["J4"].fill.fgColor.rgb == summary_compare_book.active["G4"].fill.fgColor.rgb
     summary_compare_book.close()
+
+    external_previous_path = OUT / "external-previous-summary.xlsx"
+    external_current_path = OUT / "external-current-summary.xlsx"
+    for path, rows in (
+        (external_previous_path, [["Brand E", 1, "External Product", "External Spec", "Ignore Me", 10, "Previous"]]),
+        (external_current_path, [
+            ["Brand E", 1, "External Product", "External Spec", "Different Data", 15, "Current"],
+            ["Brand E", 2, "External New", "New Spec", "Any Value", 4, "Current"],
+            ["", "", "合计", "", "", 19, ""],
+        ]),
+    ):
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet["A1"] = "第三方库存汇总"
+        headers = ["品牌", "序号", "名称", "规格", "仓库信息", "合计", "说明"]
+        sheet.append(headers)
+        for row in rows:
+            sheet.append(row)
+        for row_number in range(2, sheet.max_row + 1):
+            sheet.cell(row_number, 6).fill = openpyxl.styles.PatternFill("solid", fgColor="FFF2CC")
+        workbook.save(path)
+        workbook.close()
+    external_compare = app.make_summary_compare_result(
+        app.parse_summary_compare_workbook(external_previous_path),
+        app.parse_summary_compare_workbook(external_current_path),
+    )
+    assert {row["name"]: row["remark"] for row in external_compare}["External New"] == "新增物料"
+    external_compare_path = OUT / "external-summary-compare.xlsx"
+    app.export_summary_compare({"records": external_compare, "current_path": str(external_current_path)}, external_compare_path)
+    external_compare_book = openpyxl.load_workbook(external_compare_path, data_only=True)
+    external_compare_sheet = external_compare_book.active
+    assert external_compare_sheet["A1"].value == "第三方库存汇总"
+    assert external_compare_sheet["G2"].value == "环比"
+    assert external_compare_sheet["H2"].value == "备注"
+    assert external_compare_sheet["I2"].value == "说明"
+    assert external_compare_sheet["G3"].value == 0.5
+    assert external_compare_sheet["H4"].value == "新增物料"
+    assert external_compare_sheet["G2"].fill.fgColor.rgb == external_compare_sheet["F2"].fill.fgColor.rgb
+    assert external_compare_sheet["H3"].fill.fgColor.rgb == external_compare_sheet["F3"].fill.fgColor.rgb
+    external_compare_book.close()
+
+    performance_summary_path = OUT / "performance-summary.xlsx"
+    performance_book = openpyxl.Workbook(write_only=True)
+    performance_sheet = performance_book.create_sheet("Summary")
+    performance_sheet.append(["品牌", "序号", "名称", "规格", "仓库信息", "合计"])
+    for serial in range(1, 5001):
+        performance_sheet.append(["Performance Brand", serial, f"Product {serial}", "Spec", "Unused", serial])
+    performance_book.save(performance_summary_path)
+    performance_book.close()
+    started = perf_counter()
+    performance_records = app.parse_summary_compare_workbook(performance_summary_path)
+    assert len(performance_records) == 5000
+    assert perf_counter() - started < 5
 
     special_book = openpyxl.Workbook()
     special_sheet = special_book.active
@@ -279,8 +357,8 @@ def main():
     except ValueError as exc:
         assert "单工作表" in str(exc)
 
-    original_save_config = app.save_config
-    app.save_config = lambda config: None
+    original_save_config = inventory_service.save_config
+    inventory_service.save_config = lambda config: None
     try:
         special_session = app.InventoryApp()
         special_session.config = app.default_config()
@@ -317,7 +395,7 @@ def main():
         assert summary_compare_record["filename"].startswith("汇总对比_")
         assert Path(summary_compare_record["path"]).is_file()
     finally:
-        app.save_config = original_save_config
+        inventory_service.save_config = original_save_config
 
     try:
         app.decimal_number("NaN")
@@ -383,17 +461,46 @@ def main():
     total_session.clear_summary()
 
     opened_logs = []
-    original_log_path = app.LOG_PATH
+    original_log_path = inventory_core.LOG_PATH
     original_startfile = app.os.startfile
-    app.LOG_PATH = OUT / "inventory-workbench.log"
+    original_save_config = inventory_service.save_config
+    inventory_core.LOG_PATH = OUT / "inventory-workbench.log"
     app.os.startfile = lambda path: opened_logs.append(path)
+    inventory_service.save_config = lambda config: None
     try:
-        app.InventoryApp().open_diagnostic_log()
+        app.configure_logging(False)
+        logged_session = app.InventoryApp()
+        logged_session.config = app.default_config()
+        logged_session.config["settings"]["export_path"] = str(OUT)
+        try:
+            logged_session.open_diagnostic_log()
+            raise AssertionError("diagnostic log must not open before logging is enabled")
+        except ValueError as exc:
+            assert "诊断日志尚未开启" in str(exc)
+        logged_session.update_settings({
+            **logged_session.config["settings"],
+            "log_enabled": True,
+        })
+        logged_session.open_diagnostic_log()
+        logged_session.clear_compare()
+        try:
+            logged_session.stage_compare_file("invalid", Upload(FIXTURE_A))
+        except ValueError:
+            pass
+        app.configure_logging(False)
+        log_content = (OUT / "inventory-workbench.log").read_text(encoding="utf-8")
     finally:
-        app.LOG_PATH = original_log_path
+        app.configure_logging(False)
+        inventory_core.LOG_PATH = original_log_path
         app.os.startfile = original_startfile
+        inventory_service.save_config = original_save_config
     assert opened_logs == [str(OUT / "inventory-workbench.log")]
     assert (OUT / "inventory-workbench.log").is_file()
+    assert "operation action=diagnostic_log status=enabled" in log_content
+    assert "operation action=diagnostic_log.open status=completed" in log_content
+    assert "inventory.clear_compare" in log_content
+    assert "inventory.stage_compare_file" in log_content
+    assert "status=failed" in log_content
     assert not hasattr(app.InventoryApp, "reexport")
     print("engine verification passed")
 
