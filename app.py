@@ -22,7 +22,7 @@ from email.parser import BytesParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from logging.handlers import RotatingFileHandler
 
@@ -77,7 +77,7 @@ def default_config():
             "summary_filename": "库存汇总_{生成日期}.xlsx",
             "log_enabled": False,
         },
-        "mappings": {},
+        "mappings": [],
         "export_records": [],
     }
 
@@ -124,11 +124,53 @@ def load_config():
                 pass
         config = default_config()
     config.setdefault("settings", default_config()["settings"])
-    config.setdefault("mappings", {})
+    config.setdefault("mappings", [])
     config.setdefault("export_records", [])
     for key, value in default_config()["settings"].items():
         config["settings"].setdefault(key, value)
     config_changed = False
+    if isinstance(config["mappings"], dict):
+        config["mappings"] = [
+            {
+                "id": uuid.uuid4().hex,
+                "brand": normalize_text(brand),
+                "source_warehouse": normalize_text(warehouse),
+                "target_warehouse": "德清仓",
+            }
+            for brand, warehouse in config["mappings"].items()
+            if normalize_text(brand) and normalize_text(warehouse)
+        ]
+        config_changed = True
+    elif not isinstance(config["mappings"], list):
+        config["mappings"] = []
+        config_changed = True
+    else:
+        normalized_mappings = []
+        mapping_keys = set()
+        for mapping in config["mappings"]:
+            if not isinstance(mapping, dict):
+                config_changed = True
+                continue
+            brand = normalize_text(mapping.get("brand"))
+            source_warehouse = normalize_text(mapping.get("source_warehouse", mapping.get("warehouse")))
+            target_warehouse = normalize_text(mapping.get("target_warehouse")) or "德清仓"
+            if not brand or not source_warehouse:
+                config_changed = True
+                continue
+            key = (brand, source_warehouse)
+            if key in mapping_keys:
+                config_changed = True
+                continue
+            mapping_keys.add(key)
+            normalized_mappings.append({
+                "id": normalize_text(mapping.get("id")) or uuid.uuid4().hex,
+                "brand": brand,
+                "source_warehouse": source_warehouse,
+                "target_warehouse": target_warehouse,
+            })
+        if normalized_mappings != config["mappings"]:
+            config["mappings"] = normalized_mappings
+            config_changed = True
     if config["settings"]["compare_filename"] == "{品牌}_库存对比_{本周日期}.xlsx":
         config["settings"]["compare_filename"] = default_config()["settings"]["compare_filename"]
         config_changed = True
@@ -271,17 +313,19 @@ def find_last_total_row(path):
     except Exception:
         return None
     try:
-        sheet = workbook.active
-        for row_number in range(sheet.max_row, 1, -1):
-            values = [sheet.cell(row_number, column).value for column in range(1, sheet.max_column + 1)]
-            if not any(value is not None and str(value).strip() for value in values):
-                continue
-            marker = next((total_marker(value) for value in values if total_marker(value)), None)
-            if marker:
-                return {"row": row_number, "label": marker}
-            return None
+        return find_last_total_row_in_sheet(workbook.active)
     finally:
         workbook.close()
+    return None
+
+
+def find_last_total_row_in_sheet(sheet):
+    for row_number in range(sheet.max_row, 1, -1):
+        values = [sheet.cell(row_number, column).value for column in range(1, sheet.max_column + 1)]
+        if not any(value is not None and str(value).strip() for value in values):
+            continue
+        marker = next((total_marker(value) for value in values if total_marker(value)), None)
+        return {"row": row_number, "label": marker} if marker else None
     return None
 
 
@@ -324,14 +368,16 @@ def parse_inventory_workbook(path, brand):
         elif header_values != REQUIRED_COLUMNS:
             details.append("列顺序与样例不一致，请在“库存量(主单位)”后增加“库存状态”列")
         workbook.close()
-        workbook.close()
         return {"rows": [], "errors": [{"message": "；".join(details), "sheet": sheet.title, "row": 1}], "warnings": []}
 
     index = {name: header_values.index(name) for name in REQUIRED_COLUMNS}
+    total_row = find_last_total_row_in_sheet(sheet)
     rows = []
     specs_by_product = {}
     codes_by_name_spec = {}
     for excel_row, values in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
+        if total_row and excel_row == total_row["row"]:
+            continue
         if not any(value is not None and str(value).strip() for value in values):
             continue
         raw = {name: values[index[name]] if index[name] < len(values) else None for name in REQUIRED_COLUMNS}
@@ -489,15 +535,18 @@ def find_cross_code_warnings(imports):
 
 
 def build_summary_result(imports, mappings):
-    warehouse_order = ["德清仓"]
+    mapping_targets = {
+        (mapping["brand"], mapping["source_warehouse"]): mapping["target_warehouse"]
+        for mapping in mappings
+    }
+    warehouse_order = []
     result_rows = []
     for imported in imports:
         brand = imported["brand"]
-        mapped_warehouse = mappings.get(brand)
         product_rows = {}
         for row in imported["rows"]:
-            warehouse = "德清仓" if mapped_warehouse and row["warehouse"] == mapped_warehouse else row["warehouse"]
-            if warehouse != "德清仓" and warehouse not in warehouse_order:
+            warehouse = mapping_targets.get((brand, row["warehouse"]), row["warehouse"])
+            if warehouse not in warehouse_order:
                 warehouse_order.append(warehouse)
             product_key = (row["code"], row["name"])
             product = product_rows.setdefault(
@@ -514,18 +563,22 @@ def build_summary_result(imports, mappings):
             product["total_main"] = sum((item["main_qty"] for item in product["warehouses"].values()), Decimal("0"))
             product["total_box"] = sum((item["box_qty"] for item in product["warehouses"].values()), Decimal("0"))
             result_rows.append(product)
+    if "德清仓" in warehouse_order:
+        warehouse_order.remove("德清仓")
+        warehouse_order.insert(0, "德清仓")
     unconfigured = []
     for item in imports:
-        source_warehouses = sorted({row["warehouse"] for row in item["rows"]})
-        mapped_warehouse = mappings.get(item["brand"])
-        if not mapped_warehouse:
-            unconfigured.append({"brand": item["brand"], "warehouses": source_warehouses, "reason": "未配置"})
-        elif mapped_warehouse not in source_warehouses:
+        source_warehouses = {row["warehouse"] for row in item["rows"]}
+        stale_sources = sorted(
+            source for (brand, source), _target in mapping_targets.items()
+            if brand == item["brand"] and source not in source_warehouses
+        )
+        if stale_sources:
             unconfigured.append(
                 {
                     "brand": item["brand"],
-                    "warehouses": source_warehouses,
-                    "reason": f"已配置的源仓库“{mapped_warehouse}”未在本次导入文件中找到",
+                    "warehouses": sorted(source_warehouses),
+                    "reason": f"已配置的源仓库“{'、'.join(stale_sources)}”未在本次导入文件中找到",
                 }
             )
     return {"warehouses": warehouse_order, "rows": result_rows, "unconfigured": unconfigured}
@@ -840,7 +893,7 @@ def split_special_brand_workbook(path, export_directory):
 
     targets = []
     for brand, row_values in grouped_rows.items():
-        output = unique_export_path(export_directory, f"{brand}.xlsx")
+        output = unique_export_path(export_directory, f"{brand}_品牌拆分_{datetime.now():%Y-%m-%d}.xlsx")
         source_book = openpyxl.load_workbook(path)
         try:
             source_sheet = source_book.active
@@ -906,12 +959,17 @@ class InventoryApp:
         self.summary_compare_uploads = {}
         self.summary_compare_results = {}
         self.compare_uploads = {}
+        self.special_brand_upload = None
+        self.special_brand_results = []
         self.operation_lock = threading.RLock()
 
     def state(self):
         return {
             "settings": self.config["settings"],
-            "mappings": [{"brand": brand, "warehouse": warehouse} for brand, warehouse in sorted(self.config["mappings"].items())],
+            "mappings": sorted(
+                self.config["mappings"],
+                key=lambda item: (item["brand"], item["source_warehouse"], item["target_warehouse"]),
+            ),
             "exports": self.config["export_records"],
             "summary_compare_uploads": {
                 slot: self.summary_compare_upload_overview(slot)
@@ -924,6 +982,8 @@ class InventoryApp:
                 for slot in ("previous", "current")
                 if slot in self.compare_uploads
             },
+            "special_brand_upload": self.special_brand_upload_overview(),
+            "special_brand_results": self.special_brand_results,
         }
 
     @staticmethod
@@ -1079,7 +1139,7 @@ class InventoryApp:
         if not result:
             raise ValueError("汇总对比结果已失效，请重新上传并生成")
         target = unique_export_path(
-            self.config["settings"]["export_path"], f"库存汇总对比_{datetime.now():%Y-%m-%d}.xlsx"
+            self.config["settings"]["export_path"], f"汇总对比_{datetime.now():%Y-%m-%d}.xlsx"
         )
         export_summary_compare(result, target)
         log_event("exported summary compare file=%s", target)
@@ -1090,15 +1150,72 @@ class InventoryApp:
         self.delete_uploads(item["path"] for item in self.summary_compare_uploads.values())
         self.summary_compare_uploads = {}
 
-    def split_special_brand(self, file_item):
+    def stage_special_brand_file(self, file_item):
         path, filename = self.save_upload(file_item)
-        try:
-            targets = split_special_brand_workbook(path, self.config["settings"]["export_path"])
-        finally:
-            self.delete_uploads([path])
+        if self.special_brand_upload:
+            self.delete_uploads([self.special_brand_upload["path"]])
+        self.special_brand_upload = {
+            "filename": filename,
+            "path": str(path),
+            "total_row": find_last_total_row(path),
+            "total_row_removed": None,
+        }
+        self.special_brand_results = []
+        return self.special_brand_upload_overview()
+
+    def special_brand_upload_overview(self):
+        item = self.special_brand_upload
+        if not item:
+            return None
+        return {
+            "filename": item["filename"],
+            "total_row": item["total_row"],
+            "total_row_removed": item["total_row_removed"],
+        }
+
+    def remove_special_brand_total_row(self):
+        if not self.special_brand_upload:
+            raise ValueError("请先上传需要拆分的特殊品牌库存表")
+        removed = remove_last_total_row(self.special_brand_upload["path"])
+        self.special_brand_upload["total_row"] = None
+        self.special_brand_upload["total_row_removed"] = removed
+        self.special_brand_results = []
+        return self.special_brand_upload_overview()
+
+    def split_special_brand(self):
+        if not self.special_brand_upload:
+            raise ValueError("请先上传需要拆分的特殊品牌库存表")
+        targets = split_special_brand_workbook(
+            self.special_brand_upload["path"], self.config["settings"]["export_path"]
+        )
         records = [self.add_export_record(item["path"], "特殊品牌拆分", item["brand"], "") for item in targets]
-        log_event("split special brand source=%s files=%d", filename, len(records))
-        return [{"brand": item["brand"], "rows": item["rows"], "record": record} for item, record in zip(targets, records)]
+        self.special_brand_results = [
+            {"brand": item["brand"], "rows": item["rows"], "record": record}
+            for item, record in zip(targets, records)
+        ]
+        log_event("split special brand source=%s files=%d", self.special_brand_upload["filename"], len(records))
+        return self.special_brand_results
+
+    def clear_special_brand(self):
+        if self.special_brand_upload:
+            self.delete_uploads([self.special_brand_upload["path"]])
+        self.special_brand_upload = None
+        self.special_brand_results = []
+
+    def special_brand_export(self, record_id):
+        record = next(
+            (
+                item for item in self.config["export_records"]
+                if item["id"] == record_id and item["type"] == "特殊品牌拆分"
+            ),
+            None,
+        )
+        if not record:
+            raise ValueError("未找到特殊品牌拆分导出文件")
+        path = Path(record["path"])
+        if not path.is_file():
+            raise ValueError("导出文件已不存在")
+        return path
 
     def compare_upload_overview(self, slot):
         item = self.compare_uploads.get(slot)
@@ -1219,17 +1336,6 @@ class InventoryApp:
         save_config(self.config)
         return record
 
-    def reexport(self, record_id):
-        record = next((item for item in self.config["export_records"] if item["id"] == record_id), None)
-        if not record:
-            raise ValueError("未找到该导出记录")
-        source = Path(record["path"])
-        if not source.is_file():
-            raise ValueError("原导出文件已不存在，无法重新导出")
-        target = unique_export_path(self.config["settings"]["export_path"], source.name)
-        shutil.copy2(source, target)
-        return self.add_export_record(target, record["type"], record["brands"], record.get("result_id", ""))
-
     def update_settings(self, settings):
         export_path = Path(str(settings.get("export_path", "")).strip())
         if not export_path:
@@ -1248,6 +1354,11 @@ class InventoryApp:
         configure_logging(log_enabled)
         log_event("settings updated export_path=%s", export_path)
         return self.config["settings"]
+
+    def open_diagnostic_log(self):
+        ensure_directories()
+        LOG_PATH.touch(exist_ok=True)
+        os.startfile(str(LOG_PATH))
 
 
 def serialize_compare(records):
@@ -1308,6 +1419,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/state":
             self.send_json({"ok": True, "data": APP.state()})
             return
+        if parsed.path == "/api/special-brand/download":
+            record_id = normalize_text(parse_qs(parsed.query).get("record_id", [""])[0])
+            try:
+                path = APP.special_brand_export(record_id)
+            except ValueError as exc:
+                self.send_error_json(str(exc), HTTPStatus.NOT_FOUND)
+                return
+            self.send_download(path)
+            return
         if parsed.path == "/":
             self.serve_file(WEB_ROOT / "index.html")
             return
@@ -1336,6 +1456,18 @@ class RequestHandler(BaseHTTPRequestHandler):
         data = path.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_download(self, path):
+        data = path.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header(
+            "Content-Type",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(path.name)}")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -1397,12 +1529,22 @@ class RequestHandler(BaseHTTPRequestHandler):
             APP.clear_summary_compare()
             self.send_json({"ok": True})
             return
-        if path == "/api/special-brand/split":
+        if path == "/api/special-brand/upload":
             form = self.read_form()
             file_item = form["file"] if "file" in form else None
             if file_item is None or not file_item.filename:
                 raise ValueError("请选择需要拆分的特殊品牌库存表")
-            self.send_json({"ok": True, "data": APP.split_special_brand(file_item)})
+            self.send_json({"ok": True, "data": APP.stage_special_brand_file(file_item)})
+            return
+        if path == "/api/special-brand/remove-total-row":
+            self.send_json({"ok": True, "data": APP.remove_special_brand_total_row()})
+            return
+        if path == "/api/special-brand/split":
+            self.send_json({"ok": True, "data": APP.split_special_brand()})
+            return
+        if path == "/api/special-brand/clear":
+            APP.clear_special_brand()
+            self.send_json({"ok": True})
             return
         if path == "/api/summary/delete-import":
             payload = self.read_json()
@@ -1465,22 +1607,60 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/mapping":
             payload = self.read_json()
             brand = normalize_text(payload.get("brand"))
-            warehouse = normalize_text(payload.get("warehouse"))
-            if not brand or not warehouse:
-                raise ValueError("品牌和对应源仓库名称不能为空")
+            source_warehouse = normalize_text(payload.get("source_warehouse"))
+            target_warehouse = normalize_text(payload.get("target_warehouse")) or "德清仓"
+            if not brand or not source_warehouse:
+                raise ValueError("品牌和源仓库名称不能为空")
             imported = next((item for item in APP.summary_imports if item["brand"] == brand), None)
             if imported:
                 warehouses = {row["warehouse"] for row in imported["rows"]}
-                if warehouse not in warehouses:
-                    raise ValueError(f"品牌“{brand}”本次导入的文件中不存在源仓库“{warehouse}”")
-            APP.config["mappings"][brand] = warehouse
+                if source_warehouse not in warehouses:
+                    raise ValueError(f"品牌“{brand}”本次导入的文件中不存在源仓库“{source_warehouse}”")
+            if any(
+                item["brand"] == brand and item["source_warehouse"] == source_warehouse
+                for item in APP.config["mappings"]
+            ):
+                raise ValueError("该品牌和源仓库名称的映射已存在，请使用编辑功能修改")
+            APP.config["mappings"].append({
+                "id": uuid.uuid4().hex,
+                "brand": brand,
+                "source_warehouse": source_warehouse,
+                "target_warehouse": target_warehouse,
+            })
+            APP.summary_results.clear()
+            save_config(APP.config)
+            self.send_json({"ok": True, "data": APP.state()["mappings"]})
+            return
+        if path == "/api/mapping/update":
+            payload = self.read_json()
+            mapping_id = normalize_text(payload.get("id"))
+            brand = normalize_text(payload.get("brand"))
+            source_warehouse = normalize_text(payload.get("source_warehouse"))
+            target_warehouse = normalize_text(payload.get("target_warehouse")) or "德清仓"
+            mapping = next((item for item in APP.config["mappings"] if item["id"] == mapping_id), None)
+            if not mapping:
+                raise ValueError("未找到需要编辑的仓库映射")
+            if not brand or not source_warehouse:
+                raise ValueError("品牌和源仓库名称不能为空")
+            imported = next((item for item in APP.summary_imports if item["brand"] == brand), None)
+            if imported and source_warehouse not in {row["warehouse"] for row in imported["rows"]}:
+                raise ValueError(f"品牌“{brand}”本次导入的文件中不存在源仓库“{source_warehouse}”")
+            if any(
+                item["id"] != mapping_id and item["brand"] == brand and item["source_warehouse"] == source_warehouse
+                for item in APP.config["mappings"]
+            ):
+                raise ValueError("该品牌和源仓库名称的映射已存在")
+            mapping.update({"brand": brand, "source_warehouse": source_warehouse, "target_warehouse": target_warehouse})
             APP.summary_results.clear()
             save_config(APP.config)
             self.send_json({"ok": True, "data": APP.state()["mappings"]})
             return
         if path == "/api/mapping/delete":
-            brand = normalize_text(self.read_json().get("brand"))
-            APP.config["mappings"].pop(brand, None)
+            mapping_id = normalize_text(self.read_json().get("id"))
+            original_count = len(APP.config["mappings"])
+            APP.config["mappings"] = [item for item in APP.config["mappings"] if item["id"] != mapping_id]
+            if len(APP.config["mappings"]) == original_count:
+                raise ValueError("未找到需要删除的仓库映射")
             APP.summary_results.clear()
             save_config(APP.config)
             self.send_json({"ok": True, "data": APP.state()["mappings"]})
@@ -1493,8 +1673,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             os.startfile(str(target))
             self.send_json({"ok": True})
             return
-        if path == "/api/export/reexport":
-            self.send_json({"ok": True, "data": APP.reexport(self.read_json().get("record_id", ""))})
+        if path == "/api/log/open":
+            APP.open_diagnostic_log()
+            self.send_json({"ok": True})
             return
         if path == "/api/choose-directory":
             self.send_json({"ok": True, "data": {"path": choose_directory(APP.config["settings"]["export_path"])}})

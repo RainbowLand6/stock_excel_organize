@@ -17,6 +17,7 @@ TOTAL_FIXTURE = OUT / "fixture-with-total.xlsx"
 TOTAL_MARKER_FIXTURE = OUT / "fixture-with-total-marker.xlsx"
 TOTAL_LIKE_PRODUCT_FIXTURE = OUT / "fixture-with-total-like-product.xlsx"
 SPECIAL_BRAND_FIXTURE = OUT / "special-brand.xlsx"
+SPECIAL_BRAND_TOTAL_FIXTURE = OUT / "special-brand-with-total.xlsx"
 
 
 def write_fixture(path, rows):
@@ -28,6 +29,12 @@ def write_fixture(path, rows):
         sheet.append(row)
     workbook.save(path)
     workbook.close()
+
+
+class Upload:
+    def __init__(self, path):
+        self.filename = path.name
+        self.file = path.open("rb")
 
 
 def main():
@@ -58,6 +65,7 @@ def main():
     legacy_config = app.default_config()
     legacy_config["settings"]["compare_filename"] = "{品牌}_库存对比_{本周日期}.xlsx"
     legacy_config["export_records"] = [{"type": "库存对比"}]
+    legacy_config["mappings"] = {"Legacy Brand": "Legacy Source"}
     app.CONFIG_PATH = legacy_config_path
     try:
         app.save_config(legacy_config)
@@ -66,6 +74,9 @@ def main():
         app.CONFIG_PATH = original_config_path
     assert migrated_config["settings"]["compare_filename"] == "{品牌}_单品牌库存对比_{本周日期}.xlsx"
     assert migrated_config["export_records"][0]["type"] == "单品牌库存对比"
+    assert migrated_config["mappings"][0]["brand"] == "Legacy Brand"
+    assert migrated_config["mappings"][0]["source_warehouse"] == "Legacy Source"
+    assert migrated_config["mappings"][0]["target_warehouse"] == "德清仓"
 
     write_fixture(
         FIXTURE_A,
@@ -117,6 +128,9 @@ def main():
     assert not current["errors"], current["errors"]
     assert len(previous["rows"]) == 3
     assert len(current["rows"]) == 3
+    total_parse = app.parse_inventory_workbook(TOTAL_FIXTURE, "fixture-total")
+    assert not total_parse["errors"], total_parse["errors"]
+    assert len(total_parse["rows"]) == 1
 
     compare = app.make_compare_result("fixture-a", previous["rows"], current["rows"])
     by_code = {row["code"]: row for row in compare}
@@ -141,9 +155,14 @@ def main():
             {"brand": "fixture-a", "rows": previous["rows"]},
             {"brand": "fixture-b", "rows": current["rows"]},
         ],
-        {"fixture-a": "Warehouse A", "fixture-b": "Warehouse C"},
+        [
+            {"brand": "fixture-a", "source_warehouse": "Warehouse A", "target_warehouse": "德清仓"},
+            {"brand": "fixture-a", "source_warehouse": "Warehouse B", "target_warehouse": "德清仓"},
+            {"brand": "fixture-b", "source_warehouse": "Warehouse C", "target_warehouse": "华东仓"},
+        ],
     )
     assert summary["warehouses"][0] == "德清仓"
+    assert "华东仓" in summary["warehouses"]
     assert not summary["unconfigured"]
     assert summary["rows"]
 
@@ -224,8 +243,18 @@ def main():
     special_sheet["A1"].fill = openpyxl.styles.PatternFill("solid", fgColor="00FF00")
     special_book.save(SPECIAL_BRAND_FIXTURE)
     special_book.close()
+    write_fixture(
+        SPECIAL_BRAND_TOTAL_FIXTURE,
+        [
+            ["SP-001", "Special A", "Spec A", "Brand One-East Warehouse", "Lot", "Piece", 2, "Available", "Org", 1],
+            ["SP-002", "Special B", "Spec B", "Brand One-West Warehouse", "Lot", "Piece", 3, "Available", "Org", 1],
+            ["SP-003", "Special C", "Spec C", "Brand Two-South Warehouse", "Lot", "Piece", 4, "Available", "Org", 2],
+            ["", "合计", "", "", "", "", 9, "", "", 4],
+        ],
+    )
     split_results = app.split_special_brand_workbook(SPECIAL_BRAND_FIXTURE, OUT)
     assert {(item["brand"], item["rows"]) for item in split_results} == {("Brand One", 2), ("Brand Two", 1)}
+    assert all(item["path"].name.startswith(f"{item['brand']}_品牌拆分_") for item in split_results)
     split_brand_one = next(item["path"] for item in split_results if item["brand"] == "Brand One")
     split_book = openpyxl.load_workbook(split_brand_one, data_only=True)
     assert split_book.active["D2"].value == "East Warehouse"
@@ -244,22 +273,42 @@ def main():
     except ValueError as exc:
         assert "单工作表" in str(exc)
 
-    reexport_app = app.InventoryApp()
-    reexport_app.config = app.default_config()
-    reexport_app.config["settings"]["export_path"] = str(OUT)
-    reexport_app.config["export_records"] = [{
-        "id": "fixture-record", "filename": compare_path.name, "type": "单品牌库存对比",
-        "brands": "fixture-test", "created_at": "2026-08-21 00:00:00",
-        "path": str(compare_path), "result_id": "expired-result",
-    }]
     original_save_config = app.save_config
     app.save_config = lambda config: None
     try:
-        reexported = reexport_app.reexport("fixture-record")
+        special_session = app.InventoryApp()
+        special_session.config = app.default_config()
+        special_session.config["settings"]["export_path"] = str(OUT)
+        special_upload = Upload(SPECIAL_BRAND_TOTAL_FIXTURE)
+        try:
+            staged_special = special_session.stage_special_brand_file(special_upload)
+        finally:
+            special_upload.file.close()
+        assert staged_special["total_row"] == {"row": 5, "label": "合计"}
+        cleared_special = special_session.remove_special_brand_total_row()
+        assert cleared_special["total_row"] is None
+        assert cleared_special["total_row_removed"] == {"row": 5, "label": "合计"}
+        special_exports = special_session.split_special_brand()
+        assert len(special_exports) == 2
+        exported_special_path = special_session.special_brand_export(special_exports[0]["record"]["id"])
+        assert exported_special_path.is_file()
+        assert exported_special_path.name.startswith(f"{special_exports[0]['brand']}_品牌拆分_")
+        staged_path = Path(special_session.special_brand_upload["path"])
+        special_session.clear_special_brand()
+        assert special_session.special_brand_upload is None
+        assert special_session.special_brand_results == []
+        assert not staged_path.exists()
+        assert exported_special_path.is_file()
+
+        summary_compare_session = app.InventoryApp()
+        summary_compare_session.config = app.default_config()
+        summary_compare_session.config["settings"]["export_path"] = str(OUT)
+        summary_compare_session.summary_compare_results["fixture-summary-compare"] = {"records": summary_compare}
+        summary_compare_record = summary_compare_session.export_summary_compare("fixture-summary-compare")
+        assert summary_compare_record["filename"].startswith("汇总对比_")
+        assert Path(summary_compare_record["path"]).is_file()
     finally:
         app.save_config = original_save_config
-    assert Path(reexported["path"]).is_file()
-    assert reexported["path"] != str(compare_path)
 
     try:
         app.decimal_number("NaN")
@@ -269,7 +318,8 @@ def main():
     changed_spec = [dict(previous["rows"][0], spec="Changed")]
     assert app.find_compare_spec_errors(previous["rows"], changed_spec, "fixture-a.xlsx", "fixture-b.xlsx")
     invalid_mapping = app.build_summary_result(
-        [{"brand": "fixture-a", "rows": previous["rows"]}], {"fixture-a": "Missing Warehouse"}
+        [{"brand": "fixture-a", "rows": previous["rows"]}],
+        [{"brand": "fixture-a", "source_warehouse": "Missing Warehouse", "target_warehouse": "德清仓"}],
     )
     assert invalid_mapping["unconfigured"][0]["reason"].startswith("已配置的源仓库")
 
@@ -287,11 +337,6 @@ def main():
     session.summary_imports = [
         {"brand": "fixture-a", "filename": FIXTURE_A.name, "path": str(FIXTURE_A), **previous},
     ]
-    class Upload:
-        def __init__(self, path):
-            self.filename = path.name
-            self.file = path.open("rb")
-
     second_upload = Upload(FIXTURE_B)
     try:
         imported = session.import_summary_files([second_upload])
@@ -300,12 +345,14 @@ def main():
     assert [item["brand"] for item in imported] == ["fixture-a", "fixture-b"]
     reordered = session.reorder_summary_imports(["fixture-b", "fixture-a"])
     assert [item["brand"] for item in reordered] == ["fixture-b", "fixture-a"]
-    ordered_summary = app.build_summary_result(session.summary_imports, {})
+    ordered_summary = app.build_summary_result(session.summary_imports, [])
     assert ordered_summary["rows"][0]["brand"] == "fixture-b"
-    session.config["mappings"] = {"fixture-b": "Warehouse C"}
+    session.config["mappings"] = [{
+        "id": "fixture-mapping", "brand": "fixture-b", "source_warehouse": "Warehouse C", "target_warehouse": "德清仓",
+    }]
     renamed = session.rename_summary_import("fixture-b", "Renamed Brand")
     assert [item["brand"] for item in renamed] == ["Renamed Brand", "fixture-a"]
-    assert session.config["mappings"] == {"fixture-b": "Warehouse C"}
+    assert session.config["mappings"][0]["brand"] == "fixture-b"
     remaining = session.delete_summary_import("Renamed Brand")
     assert [item["brand"] for item in remaining] == ["fixture-a"]
 
@@ -325,6 +372,20 @@ def main():
     assert original_total_book.active.cell(3, 2).value == "总计"
     original_total_book.close()
     total_session.clear_summary()
+
+    opened_logs = []
+    original_log_path = app.LOG_PATH
+    original_startfile = app.os.startfile
+    app.LOG_PATH = OUT / "inventory-workbench.log"
+    app.os.startfile = lambda path: opened_logs.append(path)
+    try:
+        app.InventoryApp().open_diagnostic_log()
+    finally:
+        app.LOG_PATH = original_log_path
+        app.os.startfile = original_startfile
+    assert opened_logs == [str(OUT / "inventory-workbench.log")]
+    assert (OUT / "inventory-workbench.log").is_file()
+    assert not hasattr(app.InventoryApp, "reexport")
     print("engine verification passed")
 
 
