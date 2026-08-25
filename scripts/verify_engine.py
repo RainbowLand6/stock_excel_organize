@@ -14,6 +14,9 @@ OUT = PROJECT_ROOT / "output" / "verification"
 FIXTURE_A = OUT / "fixture-a.xlsx"
 FIXTURE_B = OUT / "fixture-b.xlsx"
 TOTAL_FIXTURE = OUT / "fixture-with-total.xlsx"
+TOTAL_MARKER_FIXTURE = OUT / "fixture-with-total-marker.xlsx"
+TOTAL_LIKE_PRODUCT_FIXTURE = OUT / "fixture-with-total-like-product.xlsx"
+SPECIAL_BRAND_FIXTURE = OUT / "special-brand.xlsx"
 
 
 def write_fixture(path, rows):
@@ -31,12 +34,34 @@ def main():
     app.ensure_directories()
     OUT.mkdir(parents=True, exist_ok=True)
 
+    original_config_path = app.CONFIG_PATH
+    legacy_config_path = OUT / "legacy-config.json"
+    legacy_config = app.default_config()
+    legacy_config["settings"]["compare_filename"] = "{品牌}_库存对比_{本周日期}.xlsx"
+    legacy_config["export_records"] = [{"type": "库存对比"}]
+    app.CONFIG_PATH = legacy_config_path
+    try:
+        app.save_config(legacy_config)
+        migrated_config = app.load_config()
+    finally:
+        app.CONFIG_PATH = original_config_path
+    assert migrated_config["settings"]["compare_filename"] == "{品牌}_单品牌库存对比_{本周日期}.xlsx"
+    assert migrated_config["export_records"][0]["type"] == "单品牌库存对比"
+
     write_fixture(
         FIXTURE_A,
         [
             ["A-001", "Product A", "Spec A", "Warehouse A", "Lot-1", "Piece", 18, "Available", "Org A", 3],
             ["A-002", "Product Zero", "Spec Z", "Warehouse A", "Lot-2", "Piece", 0, "Available", "Org A", 0],
             ["A-003", "Removed Product", "Spec R", "Warehouse B", "Lot-3", "Piece", 6, "Available", "Org A", 1],
+        ],
+    )
+    write_fixture(
+        TOTAL_MARKER_FIXTURE,
+        [
+            ["T-001", "Total Test Product", "Spec T", "Warehouse T", "Lot-1", "Piece", 12, "Available", "Org T", 2],
+            ["", "", "", "", "", "", 12, "合计", "", 2],
+            ["", "", "", "", "", "", "", "", "", ""],
         ],
     )
     write_fixture(
@@ -54,9 +79,15 @@ def main():
             ["", "总计", "", "", "", "", 12, "", "", 2],
         ],
     )
+    write_fixture(
+        TOTAL_LIKE_PRODUCT_FIXTURE,
+        [["T-002", "合计装商品", "Spec T", "Warehouse T", "Lot-2", "Piece", 9, "Available", "Org T", 1]],
+    )
 
     total_row = app.find_last_total_row(TOTAL_FIXTURE)
     assert total_row == {"row": 3, "label": "总计"}
+    assert app.find_last_total_row(TOTAL_MARKER_FIXTURE) == {"row": 3, "label": "合计"}
+    assert app.find_last_total_row(TOTAL_LIKE_PRODUCT_FIXTURE) is None
     original_total_book = openpyxl.load_workbook(TOTAL_FIXTURE, data_only=True)
     assert original_total_book.active.max_row == 3
     original_total_book.close()
@@ -71,10 +102,8 @@ def main():
     compare = app.make_compare_result("fixture-a", previous["rows"], current["rows"])
     by_code = {row["code"]: row for row in compare}
     assert len(compare) == 4
-    assert by_code["A-001"]["main_yoy_change"] == Decimal("-0.1667")
-    assert by_code["A-001"]["box_yoy_change"] == Decimal("-0.1667")
-    assert by_code["A-002"]["main_yoy_change"] is None
-    assert by_code["A-002"]["box_yoy_change"] is None
+    assert by_code["A-001"]["main_mom_change"] == Decimal("-0.1667")
+    assert by_code["A-002"]["main_mom_change"] is None
     assert by_code["B-001"]["change_type"] == "新增商品"
     assert by_code["A-003"]["change_type"] == "删除商品"
 
@@ -101,19 +130,23 @@ def main():
 
     compare_path = OUT / "compare.xlsx"
     summary_path = OUT / "summary.xlsx"
-    app.export_compare({"brand": "fixture-test", "records": compare}, compare_path)
+    export_records = [dict(compare[0], previous_main=Decimal("1.234"), current_main=Decimal("5.678"))]
+    app.export_compare({"brand": "fixture-test", "records": export_records}, compare_path)
     app.export_summary(summary, summary_path)
     assert compare_path.exists()
     assert summary_path.exists()
 
     compare_book = openpyxl.load_workbook(compare_path, data_only=True)
     compare_sheet = compare_book.active
-    assert compare_sheet["A1"].value == "fixture-test 库存对比表"
-    assert compare_sheet["I2"].value == "主单位同比变化"
-    assert compare_sheet["M2"].value == "箱数同比变化"
-    assert compare_sheet["N2"].value == "变动类型"
-    assert compare_sheet["I3"].number_format == "0.00%"
-    assert compare_sheet["M3"].number_format == "0.00%"
+    assert compare_sheet.title == "单品牌库存对比"
+    assert compare_sheet["A1"].value == "fixture-test 单品牌库存对比表"
+    assert compare_sheet["L2"].value == "环比变化"
+    assert compare_sheet["M2"].value == "变动类型"
+    assert compare_sheet["F3"].number_format == "0.00"
+    assert compare_sheet["G3"].number_format == "0.00"
+    assert compare_sheet["F3"].value == 1.23
+    assert compare_sheet["G3"].value == 5.68
+    assert compare_sheet["L3"].number_format == "0.00%"
 
     summary_book = openpyxl.load_workbook(summary_path, data_only=True)
     summary_sheet = summary_book.active
@@ -122,11 +155,81 @@ def main():
     assert summary_sheet["E2"].value == "德清仓"
     assert summary_sheet.max_row >= 4
 
+    previous_summary_path = OUT / "previous-summary.xlsx"
+    current_summary_path = OUT / "current-summary.xlsx"
+    previous_summary = {
+        "warehouses": ["德清仓"],
+        "rows": [{
+            "brand": "Brand A", "serial": 1, "name": "Product A", "spec": "Spec A",
+            "warehouses": {"德清仓": {"main_qty": Decimal("10"), "box_qty": Decimal("2")}},
+            "total_main": Decimal("10"), "total_box": Decimal("2"),
+        }],
+    }
+    current_summary = {
+        "warehouses": ["德清仓"],
+        "rows": [
+            {
+                "brand": "Brand A", "serial": 1, "name": "Product A", "spec": "Spec A",
+                "warehouses": {"德清仓": {"main_qty": Decimal("15"), "box_qty": Decimal("3")}},
+                "total_main": Decimal("15"), "total_box": Decimal("3"),
+            },
+            {
+                "brand": "Brand A", "serial": 2, "name": "Product New", "spec": "Spec N",
+                "warehouses": {"德清仓": {"main_qty": Decimal("4"), "box_qty": Decimal("1")}},
+                "total_main": Decimal("4"), "total_box": Decimal("1"),
+            },
+        ],
+    }
+    app.export_summary(previous_summary, previous_summary_path)
+    app.export_summary(current_summary, current_summary_path)
+    summary_compare = app.make_summary_compare_result(
+        app.parse_summary_compare_workbook(previous_summary_path), app.parse_summary_compare_workbook(current_summary_path)
+    )
+    compare_by_name = {row["name"]: row for row in summary_compare}
+    assert compare_by_name["Product A"]["main_mom_change"] == Decimal("0.5000")
+    assert compare_by_name["Product New"]["remark"] == "新增物料"
+    summary_compare_path = OUT / "summary-compare.xlsx"
+    app.export_summary_compare({"records": summary_compare}, summary_compare_path)
+    summary_compare_book = openpyxl.load_workbook(summary_compare_path, data_only=True)
+    assert summary_compare_book.active.title == "汇总对比"
+    assert summary_compare_book.active["G2"].value == "环比变化"
+    assert summary_compare_book.active["H4"].value == "新增物料"
+    summary_compare_book.close()
+
+    special_book = openpyxl.Workbook()
+    special_sheet = special_book.active
+    special_sheet.append(app.REQUIRED_COLUMNS)
+    special_sheet.append(["SP-001", "Special A", "Spec A", "Brand One-East Warehouse", "Lot", "Piece", 2, "Available", "Org", 1])
+    special_sheet.append(["SP-002", "Special B", "Spec B", "Brand One-West Warehouse", "Lot", "Piece", 3, "Available", "Org", 1])
+    special_sheet.append(["SP-003", "Special C", "Spec C", "Brand Two-South Warehouse", "Lot", "Piece", 4, "Available", "Org", 2])
+    special_sheet["A1"].fill = openpyxl.styles.PatternFill("solid", fgColor="00FF00")
+    special_book.save(SPECIAL_BRAND_FIXTURE)
+    special_book.close()
+    split_results = app.split_special_brand_workbook(SPECIAL_BRAND_FIXTURE, OUT)
+    assert {(item["brand"], item["rows"]) for item in split_results} == {("Brand One", 2), ("Brand Two", 1)}
+    split_brand_one = next(item["path"] for item in split_results if item["brand"] == "Brand One")
+    split_book = openpyxl.load_workbook(split_brand_one, data_only=True)
+    assert split_book.active["D2"].value == "East Warehouse"
+    assert split_book.active["D3"].value == "West Warehouse"
+    assert split_book.active["A1"].fill.fgColor.rgb == "0000FF00"
+    split_book.close()
+
+    multi_sheet_book = openpyxl.load_workbook(SPECIAL_BRAND_FIXTURE)
+    multi_sheet_book.create_sheet("Other")
+    multi_sheet_path = OUT / "special-brand-multi-sheet.xlsx"
+    multi_sheet_book.save(multi_sheet_path)
+    multi_sheet_book.close()
+    try:
+        app.split_special_brand_workbook(multi_sheet_path, OUT)
+        raise AssertionError("multi-sheet special brand workbook should be rejected")
+    except ValueError as exc:
+        assert "单工作表" in str(exc)
+
     reexport_app = app.InventoryApp()
     reexport_app.config = app.default_config()
     reexport_app.config["settings"]["export_path"] = str(OUT)
     reexport_app.config["export_records"] = [{
-        "id": "fixture-record", "filename": compare_path.name, "type": "库存对比",
+        "id": "fixture-record", "filename": compare_path.name, "type": "单品牌库存对比",
         "brands": "fixture-test", "created_at": "2026-08-21 00:00:00",
         "path": str(compare_path), "result_id": "expired-result",
     }]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import cgi
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -20,6 +21,8 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+from logging.handlers import RotatingFileHandler
 
 import openpyxl
 from openpyxl import Workbook
@@ -44,7 +47,10 @@ else:
 UPLOAD_ROOT = DATA_ROOT / "uploads"
 CONFIG_PATH = DATA_ROOT / "config.json"
 DEFAULT_EXPORT_DIR = DATA_ROOT / "exports"
+LOG_ROOT = DATA_ROOT / "logs"
+LOG_PATH = LOG_ROOT / "inventory-workbench.log"
 CONFIG_LOCK = threading.Lock()
+LOGGER = logging.getLogger("inventory_workbench")
 
 REQUIRED_COLUMNS = [
     "物料编码",
@@ -65,8 +71,9 @@ def default_config():
     return {
         "settings": {
             "export_path": str(DEFAULT_EXPORT_DIR),
-            "compare_filename": "{品牌}_库存对比_{本周日期}.xlsx",
+            "compare_filename": "{品牌}_单品牌库存对比_{本周日期}.xlsx",
             "summary_filename": "库存汇总_{生成日期}.xlsx",
+            "log_enabled": False,
         },
         "mappings": {},
         "export_records": [],
@@ -74,8 +81,28 @@ def default_config():
 
 
 def ensure_directories():
-    for directory in (DATA_ROOT, UPLOAD_ROOT, DEFAULT_EXPORT_DIR):
+    for directory in (DATA_ROOT, UPLOAD_ROOT, DEFAULT_EXPORT_DIR, LOG_ROOT):
         directory.mkdir(parents=True, exist_ok=True)
+
+
+def configure_logging(enabled):
+    """Write diagnostic events only when the user has opted in."""
+    for handler in LOGGER.handlers[:]:
+        LOGGER.removeHandler(handler)
+        handler.close()
+    LOGGER.propagate = False
+    LOGGER.setLevel(logging.INFO)
+    if not enabled:
+        return
+    ensure_directories()
+    handler = RotatingFileHandler(LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    LOGGER.addHandler(handler)
+
+
+def log_event(message, *args):
+    if LOGGER.handlers:
+        LOGGER.info(message, *args)
 
 
 def load_config():
@@ -99,6 +126,17 @@ def load_config():
     config.setdefault("export_records", [])
     for key, value in default_config()["settings"].items():
         config["settings"].setdefault(key, value)
+    config_changed = False
+    if config["settings"]["compare_filename"] == "{品牌}_库存对比_{本周日期}.xlsx":
+        config["settings"]["compare_filename"] = default_config()["settings"]["compare_filename"]
+        config_changed = True
+    for record in config["export_records"]:
+        if record.get("type") == "库存对比":
+            record["type"] = "单品牌库存对比"
+            config_changed = True
+    if config_changed:
+        save_config(config)
+    configure_logging(config["settings"]["log_enabled"])
     return config
 
 
@@ -157,33 +195,36 @@ def format_issue(filename, issue):
     return {**issue, "message": f"{location}：{issue['message']}"}
 
 
-TOTAL_ROW_MARKERS = ("总计", "合计")
+TOTAL_ROW_MARKERS = ("总计", "合计", "小计")
+
+
+def total_marker(value):
+    text = re.sub(r"\s+", "", normalize_text(value))
+    for marker in TOTAL_ROW_MARKERS:
+        if text == marker or re.fullmatch(rf"{marker}(?:[:：]|[（(].*[）)])", text):
+            return marker
+    return None
 
 
 def find_last_total_row(path):
-    """Return metadata when the final non-empty row is a total row."""
+    """Return metadata when the final non-empty row contains a total marker.
+
+    Some Excel clients preserve a trailing styled range or place the total label
+    outside the first two columns, so inspect every cell in the final value row.
+    """
     try:
         workbook = openpyxl.load_workbook(path, data_only=False, read_only=True)
     except Exception:
         return None
     try:
         sheet = workbook.active
-        header_values = [normalize_text(cell.value) for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
-        candidate_columns = [
-            index + 1
-            for index, value in enumerate(header_values)
-            if value in {"物料编码", "物料名称"}
-        ]
-        if not candidate_columns:
-            candidate_columns = [1, 2]
         for row_number in range(sheet.max_row, 1, -1):
             values = [sheet.cell(row_number, column).value for column in range(1, sheet.max_column + 1)]
             if not any(value is not None and str(value).strip() for value in values):
                 continue
-            labels = [normalize_text(sheet.cell(row_number, column).value) for column in candidate_columns]
-            label = next((value for value in labels if value), "")
-            if any(marker in value for marker in TOTAL_ROW_MARKERS for value in labels):
-                return {"row": row_number, "label": label or "总计"}
+            marker = next((total_marker(value) for value in values if total_marker(value)), None)
+            if marker:
+                return {"row": row_number, "label": marker}
             return None
     finally:
         workbook.close()
@@ -341,8 +382,7 @@ def make_compare_result(brand, previous_rows, current_rows):
                 "previous_main": before_main, "previous_box": before_box,
                 "current_main": after_main, "current_box": after_box,
                 "main_change": main_change, "box_change": box_change,
-                "main_yoy_change": percentage_change(before_main, after_main),
-                "box_yoy_change": percentage_change(before_box, after_box),
+                "main_mom_change": percentage_change(before_main, after_main),
                 "change_type": change_type,
             }
         )
@@ -437,10 +477,10 @@ def build_summary_result(imports, mappings):
     return {"warehouses": warehouse_order, "rows": result_rows, "unconfigured": unconfigured}
 
 
-def new_workbook_with_title(title, column_count):
+def new_workbook_with_title(title, column_count, sheet_name="单品牌库存对比"):
     workbook = Workbook()
     sheet = workbook.active
-    sheet.title = "库存对比"
+    sheet.title = sheet_name
     sheet.sheet_view.showGridLines = False
     sheet.append([title])
     sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=column_count)
@@ -479,27 +519,26 @@ def apply_table_styles(sheet, header_row, last_row, column_count):
 def export_compare(result, target):
     headers = [
         "品牌", "物料编码", "物料名称", "规格型号", "仓库名称",
-        "上周主单位数量", "本周主单位数量", "主单位变化值", "主单位同比变化",
-        "上周箱数", "本周箱数", "箱数变化值", "箱数同比变化", "变动类型",
+        "上周主单位数量", "本周主单位数量", "主单位变化值",
+        "上周箱数", "本周箱数", "箱数变化值", "环比变化", "变动类型",
     ]
-    workbook, sheet = new_workbook_with_title(f"{result['brand']} 库存对比表", len(headers))
+    workbook, sheet = new_workbook_with_title(f"{result['brand']} 单品牌库存对比表", len(headers))
     sheet.append(headers)
     for row in result["records"]:
         sheet.append([
             row["brand"], row["code"], row["name"], row["spec"], row["warehouse"],
-            display_number(row["previous_main"]), display_number(row["current_main"]), display_number(row["main_change"]),
-            display_number(row["main_yoy_change"]), display_number(row["previous_box"]), display_number(row["current_box"]),
-            display_number(row["box_change"]), display_number(row["box_yoy_change"]), row["change_type"],
+            display_number(round_decimal(row["previous_main"])), display_number(round_decimal(row["current_main"])), display_number(row["main_change"]),
+            display_number(row["previous_box"]), display_number(row["current_box"]), display_number(row["box_change"]),
+            display_number(row["main_mom_change"]), row["change_type"],
         ])
     apply_table_styles(sheet, 2, sheet.max_row, len(headers))
-    widths = [14, 14, 22, 18, 16, 15, 15, 15, 15, 12, 12, 12, 15, 14]
+    widths = [14, 14, 22, 18, 16, 15, 15, 15, 12, 12, 12, 15, 14]
     for column, width in enumerate(widths, start=1):
         sheet.column_dimensions[get_column_letter(column)].width = width
     for row in range(3, sheet.max_row + 1):
-        sheet.cell(row, 9).number_format = "0.00%"
-        sheet.cell(row, 13).number_format = "0.00%"
-        for column in (10, 11, 12):
+        for column in (6, 7, 9, 10, 11):
             sheet.cell(row, column).number_format = "0.00"
+        sheet.cell(row, 12).number_format = "0.00%"
     for row in range(3, sheet.max_row + 1):
         type_cell = sheet.cell(row, len(headers))
         if type_cell.value in ("新增商品", "库存增加"):
@@ -599,6 +638,171 @@ def export_summary(result, target):
     workbook.save(target)
 
 
+def find_summary_total_column(sheet):
+    """Locate the total main-unit column in an exported summary workbook."""
+    for header_row in range(2, min(sheet.max_row, 10) + 1):
+        labels = [normalize_text(sheet.cell(header_row, column).value) for column in range(1, sheet.max_column + 1)]
+        if not {"品牌", "名称", "规格"}.issubset(set(labels)):
+            continue
+        brand_column = labels.index("品牌") + 1
+        name_column = labels.index("名称") + 1
+        spec_column = labels.index("规格") + 1
+        group_row = header_row - 1
+        for column in range(1, sheet.max_column + 1):
+            if normalize_text(sheet.cell(group_row, column).value) != "合计":
+                continue
+            if "主单位" in normalize_text(sheet.cell(header_row, column).value):
+                return {
+                    "header_row": header_row,
+                    "brand_column": brand_column,
+                    "name_column": name_column,
+                    "spec_column": spec_column,
+                    "total_main_column": column,
+                }
+    raise ValueError("未识别到汇总表的“品牌、名称、规格、合计（主单位）”列，请上传本软件导出的库存汇总表")
+
+
+def parse_summary_compare_workbook(path):
+    """Read totals from a workbook produced by the inventory summary export."""
+    try:
+        workbook = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    except Exception as exc:
+        raise ValueError(f"无法读取汇总表：{exc}") from exc
+    try:
+        sheet = workbook.active
+        columns = find_summary_total_column(sheet)
+        records = []
+        current_brand = ""
+        for row_number in range(columns["header_row"] + 1, sheet.max_row + 1):
+            brand = normalize_text(sheet.cell(row_number, columns["brand_column"]).value) or current_brand
+            name = normalize_text(sheet.cell(row_number, columns["name_column"]).value)
+            spec = normalize_text(sheet.cell(row_number, columns["spec_column"]).value)
+            if not any((brand, name, spec)):
+                continue
+            if not all((brand, name, spec)):
+                raise ValueError(f"汇总表第 {row_number} 行缺少品牌、名称或规格，无法进行汇总对比")
+            current_brand = brand
+            try:
+                total_main = decimal_number(sheet.cell(row_number, columns["total_main_column"]).value)
+            except ValueError as exc:
+                raise ValueError(f"汇总表第 {row_number} 行合计主单位{exc}") from exc
+            records.append({"brand": brand, "name": name, "spec": spec, "total_main": total_main})
+        return records
+    finally:
+        workbook.close()
+
+
+def aggregate_summary_totals(records):
+    totals = {}
+    for row in records:
+        key = (row["brand"], row["name"], row["spec"])
+        totals[key] = totals.get(key, Decimal("0")) + row["total_main"]
+    return totals
+
+
+def make_summary_compare_result(previous_records, current_records):
+    previous = aggregate_summary_totals(previous_records)
+    current = aggregate_summary_totals(current_records)
+    rows = []
+    for key in sorted(set(previous) | set(current), key=lambda value: (value[0], value[1], value[2])):
+        before = previous.get(key, Decimal("0"))
+        after = current.get(key, Decimal("0"))
+        is_new = key not in previous and key in current
+        rows.append(
+            {
+                "brand": key[0], "name": key[1], "spec": key[2],
+                "previous_total_main": before, "current_total_main": after,
+                "total_main_change": after - before,
+                "main_mom_change": percentage_change(before, after),
+                "remark": "新增物料" if is_new else "",
+            }
+        )
+    return rows
+
+
+def export_summary_compare(result, target):
+    headers = ["品牌", "物料名称", "规格", "上周合计（主单位）", "本周合计（主单位）", "合计变化值", "环比变化", "备注"]
+    workbook, sheet = new_workbook_with_title("库存汇总对比表", len(headers), sheet_name="汇总对比")
+    sheet.append(headers)
+    for row in result["records"]:
+        sheet.append([
+            row["brand"], row["name"], row["spec"],
+            display_number(round_decimal(row["previous_total_main"])),
+            display_number(round_decimal(row["current_total_main"])),
+            display_number(round_decimal(row["total_main_change"])),
+            display_number(row["main_mom_change"]), row["remark"],
+        ])
+    apply_table_styles(sheet, 2, sheet.max_row, len(headers))
+    widths = [16, 24, 18, 18, 18, 15, 15, 16]
+    for column, width in enumerate(widths, start=1):
+        sheet.column_dimensions[get_column_letter(column)].width = width
+    for row in range(3, sheet.max_row + 1):
+        for column in (4, 5, 6):
+            sheet.cell(row, column).number_format = "0.00"
+        sheet.cell(row, 7).number_format = "0.00%"
+        if sheet.cell(row, 8).value == "新增物料":
+            sheet.cell(row, 8).font = Font(name="Microsoft YaHei", size=10, bold=True, color="127145")
+    workbook.save(target)
+
+
+def find_warehouse_column(sheet):
+    for row_number in range(1, min(sheet.max_row, 10) + 1):
+        for column in range(1, sheet.max_column + 1):
+            if normalize_text(sheet.cell(row_number, column).value) == "仓库名称":
+                return {"header_row": row_number, "warehouse_column": column}
+    raise ValueError("未识别到“仓库名称”列，无法拆分特殊品牌表")
+
+
+def split_special_brand_workbook(path, export_directory):
+    """Split a combined source workbook while preserving its columns and styles."""
+    workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        if len(workbook.worksheets) != 1:
+            raise ValueError("特殊品牌拆分仅支持单工作表 Excel，避免其他工作表保留未拆分的数据")
+        sheet = workbook.active
+        columns = find_warehouse_column(sheet)
+        grouped_rows = {}
+        rows_without_separator = []
+        for row_number in range(columns["header_row"] + 1, sheet.max_row + 1):
+            values = [sheet.cell(row_number, column).value for column in range(1, sheet.max_column + 1)]
+            if not any(value is not None and str(value).strip() for value in values):
+                continue
+            warehouse = normalize_text(sheet.cell(row_number, columns["warehouse_column"]).value)
+            if "-" not in warehouse:
+                rows_without_separator.append(row_number)
+                continue
+            brand, short_warehouse = (normalize_text(value) for value in warehouse.split("-", 1))
+            if not brand or not short_warehouse:
+                raise ValueError(f"第 {row_number} 行仓库名称“{warehouse}”格式不完整，应为“品牌名-仓库名”")
+            grouped_rows.setdefault(brand, []).append((row_number, short_warehouse))
+    finally:
+        workbook.close()
+    if not grouped_rows:
+        raise ValueError("未发现“品牌名-仓库名”格式的仓库名称，无需进行特殊品牌拆分")
+    if rows_without_separator:
+        row_labels = "、".join(str(row) for row in rows_without_separator[:10])
+        suffix = "等" if len(rows_without_separator) > 10 else ""
+        raise ValueError(f"第 {row_labels}{suffix} 行仓库名称不含“-”，为避免遗漏数据，本次未拆分；请先整理为统一格式后再试")
+
+    targets = []
+    for brand, row_values in grouped_rows.items():
+        output = unique_export_path(export_directory, f"{brand}.xlsx")
+        source_book = openpyxl.load_workbook(path)
+        try:
+            source_sheet = source_book.active
+            selected = {row_number: short_warehouse for row_number, short_warehouse in row_values}
+            for row_number in range(source_sheet.max_row, columns["header_row"], -1):
+                if row_number not in selected:
+                    source_sheet.delete_rows(row_number, 1)
+            for offset, short_warehouse in enumerate(selected.values(), start=columns["header_row"] + 1):
+                source_sheet.cell(offset, columns["warehouse_column"]).value = short_warehouse
+            source_book.save(output)
+        finally:
+            source_book.close()
+        targets.append({"brand": brand, "path": output, "rows": len(row_values)})
+    return targets
+
+
 def validate_export_directory(directory):
     directory = Path(directory).resolve()
     if not directory.exists() or not directory.is_dir():
@@ -645,6 +849,8 @@ class InventoryApp:
         self.summary_imports = []
         self.compare_results = {}
         self.summary_results = {}
+        self.summary_compare_uploads = {}
+        self.summary_compare_results = {}
         self.compare_uploads = {}
         self.operation_lock = threading.RLock()
 
@@ -653,6 +859,11 @@ class InventoryApp:
             "settings": self.config["settings"],
             "mappings": [{"brand": brand, "warehouse": warehouse} for brand, warehouse in sorted(self.config["mappings"].items())],
             "exports": self.config["export_records"],
+            "summary_compare_uploads": {
+                slot: self.summary_compare_upload_overview(slot)
+                for slot in ("previous", "current")
+                if slot in self.summary_compare_uploads
+            },
             "summary_imports": [self.import_overview(item) for item in self.summary_imports],
             "compare_uploads": {
                 slot: self.compare_upload_overview(slot)
@@ -680,6 +891,7 @@ class InventoryApp:
         saved = UPLOAD_ROOT / f"{uuid.uuid4().hex}_{safe_filename(original)}"
         with saved.open("wb") as destination:
             shutil.copyfileobj(file_item.file, destination)
+        log_event("uploaded file=%s", original)
         return saved, original
 
     @staticmethod
@@ -779,6 +991,61 @@ class InventoryApp:
         self.compare_results.clear()
         return self.compare_upload_overview(slot)
 
+    def stage_summary_compare_file(self, slot, file_item):
+        if slot not in {"previous", "current"}:
+            raise ValueError("汇总对比文件类型不正确")
+        path, filename = self.save_upload(file_item)
+        previous = self.summary_compare_uploads.get(slot)
+        if previous:
+            self.delete_uploads([previous["path"]])
+        self.summary_compare_uploads[slot] = {"filename": filename, "path": str(path)}
+        self.summary_compare_results.clear()
+        return self.summary_compare_upload_overview(slot)
+
+    def summary_compare_upload_overview(self, slot):
+        item = self.summary_compare_uploads.get(slot)
+        return {"slot": slot, "filename": item["filename"]} if item else None
+
+    def compare_summaries(self):
+        previous = self.summary_compare_uploads.get("previous")
+        current = self.summary_compare_uploads.get("current")
+        if not previous or not current:
+            raise ValueError("请先上传上周和本周两张库存汇总表")
+        records = make_summary_compare_result(
+            parse_summary_compare_workbook(previous["path"]),
+            parse_summary_compare_workbook(current["path"]),
+        )
+        result_id = uuid.uuid4().hex
+        self.summary_compare_results[result_id] = {"records": records}
+        log_event("summary compared previous=%s current=%s records=%d", previous["filename"], current["filename"], len(records))
+        return {"result_id": result_id, "records": serialize_summary_compare(records)}
+
+    def export_summary_compare(self, result_id):
+        result = self.summary_compare_results.get(result_id)
+        if not result:
+            raise ValueError("汇总对比结果已失效，请重新上传并生成")
+        target = unique_export_path(
+            self.config["settings"]["export_path"], f"库存汇总对比_{datetime.now():%Y-%m-%d}.xlsx"
+        )
+        export_summary_compare(result, target)
+        log_event("exported summary compare file=%s", target)
+        return self.add_export_record(target, "库存汇总对比", "上周与本周汇总表", result_id)
+
+    def clear_summary_compare(self):
+        self.summary_compare_results.clear()
+        self.delete_uploads(item["path"] for item in self.summary_compare_uploads.values())
+        self.summary_compare_uploads = {}
+
+    def split_special_brand(self, file_item):
+        path, filename = self.save_upload(file_item)
+        try:
+            targets = split_special_brand_workbook(path, self.config["settings"]["export_path"])
+        finally:
+            self.delete_uploads([path])
+        records = [self.add_export_record(item["path"], "特殊品牌拆分", item["brand"], "") for item in targets]
+        log_event("split special brand source=%s files=%d", filename, len(records))
+        return [{"brand": item["brand"], "rows": item["rows"], "record": record} for item, record in zip(targets, records)]
+
     def compare_upload_overview(self, slot):
         item = self.compare_uploads.get(slot)
         if not item:
@@ -873,7 +1140,7 @@ class InventoryApp:
         filename = filename_from_pattern(settings["compare_filename"], {"品牌": result["brand"], "本周日期": now.strftime("%Y-%m-%d"), "生成日期": now.strftime("%Y-%m-%d")})
         target = unique_export_path(settings["export_path"], filename)
         export_compare(result, target)
-        return self.add_export_record(target, "库存对比", result["brand"], result_id)
+        return self.add_export_record(target, "单品牌库存对比", result["brand"], result_id)
 
     def export_summary(self, result_id):
         result = self.summary_results.get(result_id)
@@ -918,8 +1185,14 @@ class InventoryApp:
         summary_filename = str(settings.get("summary_filename", "")).strip()
         if not compare_filename or not summary_filename:
             raise ValueError("两类导出文件命名规则都不能为空")
-        self.config["settings"] = {"export_path": str(export_path), "compare_filename": compare_filename, "summary_filename": summary_filename}
+        log_enabled = bool(settings.get("log_enabled"))
+        self.config["settings"] = {
+            "export_path": str(export_path), "compare_filename": compare_filename,
+            "summary_filename": summary_filename, "log_enabled": log_enabled,
+        }
         save_config(self.config)
+        configure_logging(log_enabled)
+        log_event("settings updated export_path=%s", export_path)
         return self.config["settings"]
 
 
@@ -939,6 +1212,10 @@ def serialize_summary(result):
             for row in result["rows"]
         ],
     }
+
+
+def serialize_summary_compare(records):
+    return [{key: display_number(value) if isinstance(value, Decimal) else value for key, value in row.items()} for row in records]
 
 
 APP = InventoryApp()
@@ -1016,8 +1293,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             with APP.operation_lock:
                 self.route_post(urlparse(self.path).path)
         except ValueError as exc:
+            log_event("request validation error path=%s error=%s", self.path, exc)
             self.send_error_json(str(exc))
         except Exception as exc:
+            log_event("request failure path=%s error=%r", self.path, exc)
             print("Unhandled request error:", repr(exc), file=sys.stderr)
             self.send_error_json(f"操作失败：{exc}", HTTPStatus.INTERNAL_SERVER_ERROR)
 
@@ -1045,6 +1324,31 @@ class RequestHandler(BaseHTTPRequestHandler):
             if not files or not files[0].filename:
                 raise ValueError("请选择至少一个品牌 Excel 文件")
             self.send_json({"ok": True, "data": APP.import_summary_files(files)})
+            return
+        if path == "/api/summary-compare/upload":
+            form = self.read_form()
+            slot = normalize_text(form.getfirst("slot"))
+            file_item = form["file"] if "file" in form else None
+            if file_item is None or not file_item.filename:
+                raise ValueError("请选择一张库存汇总表")
+            self.send_json({"ok": True, "data": APP.stage_summary_compare_file(slot, file_item)})
+            return
+        if path == "/api/summary-compare/build":
+            self.send_json({"ok": True, "data": APP.compare_summaries()})
+            return
+        if path == "/api/summary-compare/export":
+            self.send_json({"ok": True, "data": APP.export_summary_compare(self.read_json().get("result_id", ""))})
+            return
+        if path == "/api/summary-compare/clear":
+            APP.clear_summary_compare()
+            self.send_json({"ok": True})
+            return
+        if path == "/api/special-brand/split":
+            form = self.read_form()
+            file_item = form["file"] if "file" in form else None
+            if file_item is None or not file_item.filename:
+                raise ValueError("请选择需要拆分的特殊品牌库存表")
+            self.send_json({"ok": True, "data": APP.split_special_brand(file_item)})
             return
         if path == "/api/summary/delete-import":
             payload = self.read_json()
