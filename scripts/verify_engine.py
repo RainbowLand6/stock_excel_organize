@@ -73,6 +73,8 @@ def main():
     finally:
         app.CONFIG_PATH = original_config_path
     assert migrated_config["settings"]["compare_filename"] == "{品牌}_单品牌库存对比_{本周日期}.xlsx"
+    assert migrated_config["settings"]["summary_compare_filename"] == "汇总对比_{生成日期}.xlsx"
+    assert migrated_config["settings"]["special_brand_filename"] == "{品牌}_品牌拆分_{生成日期}.xlsx"
     assert migrated_config["export_records"][0]["type"] == "单品牌库存对比"
     assert migrated_config["mappings"][0]["brand"] == "Legacy Brand"
     assert migrated_config["mappings"][0]["source_warehouse"] == "Legacy Source"
@@ -227,11 +229,15 @@ def main():
     assert compare_by_name["Product A"]["main_mom_change"] == Decimal("0.5000")
     assert compare_by_name["Product New"]["remark"] == "新增物料"
     summary_compare_path = OUT / "summary-compare.xlsx"
-    app.export_summary_compare({"records": summary_compare}, summary_compare_path)
+    app.export_summary_compare({"records": summary_compare, "current_path": str(current_summary_path)}, summary_compare_path)
     summary_compare_book = openpyxl.load_workbook(summary_compare_path, data_only=True)
-    assert summary_compare_book.active.title == "汇总对比"
-    assert summary_compare_book.active["G2"].value == "环比变化"
-    assert summary_compare_book.active["H4"].value == "新增物料"
+    current_summary_book = openpyxl.load_workbook(current_summary_path, data_only=True)
+    assert summary_compare_book.active.title == current_summary_book.active.title
+    current_summary_book.close()
+    assert summary_compare_book.active["G2"].value == "合计"
+    assert summary_compare_book.active["I2"].value == "同比"
+    assert summary_compare_book.active["J2"].value == "备注"
+    assert summary_compare_book.active["J5"].value == "新增物料"
     summary_compare_book.close()
 
     special_book = openpyxl.Workbook()
@@ -303,7 +309,10 @@ def main():
         summary_compare_session = app.InventoryApp()
         summary_compare_session.config = app.default_config()
         summary_compare_session.config["settings"]["export_path"] = str(OUT)
-        summary_compare_session.summary_compare_results["fixture-summary-compare"] = {"records": summary_compare}
+        summary_compare_session.summary_compare_results["fixture-summary-compare"] = {
+            "records": summary_compare,
+            "current_path": str(current_summary_path),
+        }
         summary_compare_record = summary_compare_session.export_summary_compare("fixture-summary-compare")
         assert summary_compare_record["filename"].startswith("汇总对比_")
         assert Path(summary_compare_record["path"]).is_file()
